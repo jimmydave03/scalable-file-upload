@@ -1,6 +1,8 @@
-name: Simple AI Review
+name: AI Code Review (MCP)
 
-on: pull_request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -8,23 +10,158 @@ permissions:
   pull-requests: write
 
 jobs:
-  review:
+  ai_review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo (full fetch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Call your AI review server
+      - name: Ensure tools (jq, curl)
         run: |
-          echo "Sending file to AI server"
-          content=$(cat $(git diff --name-only | head -1)) # pick first changed file
-          curl -X POST https://preactively-beachy-mitch.ngrok-free.dev/review \
-               -H "Content-Type: application/json" \
-               -d "{\"content\": \"$content\"}" \
-               -o review.json
+          jq --version
+          curl --version
 
-      - name: Post comment
+      - name: Fetch all changed files for PR and POST to MCP
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MCP_SERVER_URL: https://preactively-beachy-mitch.ngrok-free.dev/review
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          body=$(cat review.json | jq -r '.comments')
-          gh pr comment ${{ github.event.pull_request.number }} -b "$body"
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"        # owner/repo
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          API="https://api.github.com/repos/$REPO"
+          OUTFILE="review.json"
+
+          echo "Listing files for PR #$PR_NUMBER in $REPO"
+
+          page=1
+          files_json="[]"
+
+          # paginate and collect file metadata (filename, raw_url)
+          while :; do
+            resp=$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/pulls/$PR_NUMBER/files?per_page=100&page=$page")
+            count=$(printf "%s" "$resp" | jq 'length')
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+            # extract path & raw_url and append to files_json
+            new=$(printf "%s" "$resp" | jq -c '[.[] | {path: .filename, raw_url: .raw_url}]')
+            files_json=$(jq -s '.[0] + .[1]' <(printf "%s" "$files_json") <(printf "%s" "$new"))
+            page=$((page+1))
+          done
+
+          nf=$(printf "%s" "$files_json" | jq 'length')
+          echo "Found $nf changed files."
+
+          if [ "$nf" -eq 0 ]; then
+            echo '{"comments":"No changed files found in PR."}' > "$OUTFILE"
+            exit 0
+          fi
+
+          # Build payload files array: download content for each file and JSON-escape
+          payload_files="[]"
+          for row in $(printf "%s" "$files_json" | jq -c '.[]'); do
+            path=$(printf "%s" "$row" | jq -r '.path')
+            raw_url=$(printf "%s" "$row" | jq -r '.raw_url')
+            echo "Downloading $path"
+            if [ -z "$raw_url" ] || [ "$raw_url" = "null" ]; then
+              echo "No raw_url for $path; skipping" >&2
+              continue
+            fi
+
+            # Download raw content using GitHub token (raw_url is usually accessible)
+            content=$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" "$raw_url")
+            # JSON-escape content (preserve newlines and quotes)
+            content_json=$(jq -Rs . <<< "$content")
+
+            # Append file object to payload_files; fromjson converts the string back to JSON string value
+            payload_files=$(jq -c --arg p "$path" --arg c "$content_json" '. + [{path:$p, content:($c | fromjson)}]' <(printf "%s" "$payload_files"))
+          done
+
+          nf_ready=$(printf "%s" "$payload_files" | jq 'length')
+          echo "Prepared $nf_ready files to send to MCP server."
+
+          # Build final payload and POST
+          payload=$(jq -n --argjson files "$payload_files" --arg repo "$REPO" --arg pr "$PR_NUMBER" '{files:$files, pr:{repo:$repo, number:( $pr | tonumber)}}')
+          echo "Posting payload to MCP server at $MCP_SERVER_URL (payload has $nf_ready files)"
+          http_resp=$(curl -sS -w "\n%{http_code}" -X POST "${MCP_SERVER_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_body=$(printf "%s" "$http_resp" | sed '$d')
+          http_code=$(printf "%s" "$http_resp" | tail -n1)
+
+          echo "MCP server HTTP status: $http_code"
+          echo "$http_body" > "$OUTFILE"
+
+      - name: Validate server response and post comment (curl)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_FOR_COMMENTS: ${{ secrets.PAT_FOR_COMMENTS || '' }}
+        run: |
+          set -euo pipefail
+
+          OUTFILE="review.json"
+
+          echo "===== MCP RESPONSE ====="
+          cat "$OUTFILE" || true
+          echo "===== END MCP RESPONSE ====="
+
+          # Quick validation: must contain either comments (string) or results (array)
+          if ! jq -e '.comments // .results' "$OUTFILE" >/dev/null 2>&1; then
+            echo "MCP response missing 'comments' or 'results' field" >&2
+            cat "$OUTFILE" >&2
+            exit 1
+          fi
+
+          # Compose a human-friendly body
+          if jq -e '.comments' "$OUTFILE" >/dev/null 2>&1; then
+            body=$(jq -r '.comments' "$OUTFILE")
+          else
+            # Build summary from results array: path + summary
+            body=$(jq -r '[.results[] | "\(.path): \(.summary // \"(no summary)\")"] | join("\n\n")' "$OUTFILE")
+          fi
+
+          if [ -z "$body" ] || [ "$body" = "null" ]; then
+            echo "Empty body; nothing to post"
+            exit 0
+          fi
+
+          # If PR is from a fork, GITHUB_TOKEN may be restricted; use PAT if provided, else skip posting
+          HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          BASE_REPO="${{ github.event.pull_request.base.repo.full_name }}"
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO="${{ github.repository }}"
+
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            if [ -n "$PAT_FOR_COMMENTS" ]; then
+              AUTH_TOKEN="$PAT_FOR_COMMENTS"
+              echo "PR from fork and PAT provided: using PAT to post comment"
+            else
+              echo "PR is from a fork and no PAT provided; skipping automatic comment to avoid permission issues."
+              exit 0
+            fi
+          else
+            AUTH_TOKEN="$GITHUB_TOKEN"
+            echo "PR from same repo: using GITHUB_TOKEN to post comment"
+          fi
+
+          echo "Posting comment to $REPO PR #$PR_NUMBER"
+          http=$(curl -sS -o /dev/stderr -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$(jq -n --arg b "$body" '{body:$b}')")
+
+          echo "GitHub API HTTP status: $http"
+          if [ "$http" -ne 201 ]; then
+            echo "Failed to post comment (status $http)" >&2
+            exit 1
+          fi
+
+          echo "Comment posted successfully."

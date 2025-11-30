@@ -1,0 +1,26 @@
+name: Simple AI Review
+
+on:
+  pull_request:
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Call your AI review server
+        run: |
+          echo "Sending file to AI server"
+          content=$(cat $(git diff --name-only | head -1)) # pick first changed file
+          curl -X POST https://preactively-beachy-mitch.ngrok-free.dev/review \
+               -H "Content-Type: application/json" \
+               -d "{\"content\": \"$content\"}" \
+               -o review.json
+
+      - name: Post comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body=$(cat review.json | jq -r '.comments')
+          gh pr comment ${{ github.event.pull_request.number }} -b "$body"
